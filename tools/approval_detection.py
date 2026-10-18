@@ -956,32 +956,88 @@ def _bash_exec_payload(args: list[str]) -> tuple[bool, str | None]:
     return False, None
 
 
-# OpenSSH's documented option letters, split by whether they consume a value. A few letters
-# (-c/-m/-S/-W/-b/-e/-l/-o/-p) also exist in other tools; they are parsed in ssh's OWN context
-# here, exactly like every other carrier in this module. Sources: ssh(1), "OPTIONS".
+# --- remote-carrier unpacking -----------------------------------------------------------------
+# A "carrier" is a program whose real work is a command it passes to another
+# execution context: a remote shell (ssh, mosh, sshpass), a container (docker
+# exec, kubectl exec), a namespace (nsenter, unshare), or a login shell (su -c).
+# The fleet's workload is built from these, and without unpacking them the deny /
+# hardline / dangerous layers only ever see the benign outer program while the
+# inner command hides in its arguments as quoted DATA.
+#
+# Option tables list only the flags that CONSUME A VALUE (per the carriers' man
+# pages); every other flag is skipped as valueless, so an unknown flag costs one
+# token and the host/program boundary is still found. Boundary kinds:
+#   positional — first non-option token is the host/container/pod; the payload is
+#                everything after it            (ssh vps 'cmd'; docker exec c1 cmd)
+#   program   — the first non-option token IS the program; the payload is it plus
+#                everything after                (nsenter -t 1 rm -rf /data)
+#   wrapper   — the tail after the options is another whole command line, fed
+#                back through the recursion       (sshpass -p x ssh vps 'cmd')
+#   option-owned — the payload is the value of one option (su -c 'cmd')
+_CARRIER_POSITIONAL, _CARRIER_PROGRAM, _CARRIER_WRAPPER, _CARRIER_OPTION_OWNED = (
+    "positional", "program", "wrapper", "option-owned")
+
+# ssh(1) OPTIONS. A few letters (-c/-m/-S/-W/-b/-e/-l/-o/-p) also exist in other
+# tools; they are parsed in ssh's OWN context here, like every carrier below.
 _SSH_OPTIONS_WITH_ARG = frozenset(
     "-B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w".split())
-_SSH_OPTIONS_NO_ARG = frozenset(
-    "-4 -6 -A -a -C -f -G -g -K -k -M -N -n -q -s -T -t -V -v -X -x -Y -y".split())
+_SSHPASS_OPTIONS_WITH_ARG = frozenset("-p -P -d -f".split())  # sshpass(1): -p/-P/-d/-f
+_MOSH_OPTIONS_WITH_ARG = frozenset("-p --ssh --predict".split())  # mosh(1)
+_DOCKER_EXEC_OPTIONS_WITH_ARG = frozenset(
+    "-u -e -w --user --env --workdir --env-file".split())  # docker-exec(1)
+_KUBECTL_EXEC_OPTIONS_WITH_ARG = frozenset(
+    "-c -n -p -f --container --namespace --pod --filename --context --cluster --user "
+    "--server --kubeconfig --token --as --as-group --request-timeout".split())  # kubectl-exec(1)
+_SU_COMMAND_OPTIONS = ("-c", "--command")  # su(1): the -c value IS the command
+_SU_OPTIONS_WITH_ARG = frozenset("-s -g -G --shell --group --supp-group".split())
+_NSENTER_OPTIONS_WITH_ARG = frozenset(
+    "-t -S -G -Z -r -w -d --target --setuid --setgid --appcontext --root --wd "
+    "--dir".split())  # nsenter(1)
+_UNSHARE_OPTIONS_WITH_ARG = frozenset(
+    "-R --propagation --map-user --map-group --setgroups".split())  # unshare(1)
+
+_CARRIER_SPECS = {
+    "ssh": (_CARRIER_POSITIONAL, _SSH_OPTIONS_WITH_ARG, None),
+    "sshpass": (_CARRIER_WRAPPER, _SSHPASS_OPTIONS_WITH_ARG, None),
+    "mosh": (_CARRIER_POSITIONAL, _MOSH_OPTIONS_WITH_ARG, None),
+    "docker exec": (_CARRIER_POSITIONAL, _DOCKER_EXEC_OPTIONS_WITH_ARG, None),
+    "kubectl exec": (_CARRIER_POSITIONAL, _KUBECTL_EXEC_OPTIONS_WITH_ARG, None),
+    "su": (_CARRIER_OPTION_OWNED, _SU_OPTIONS_WITH_ARG, _SU_COMMAND_OPTIONS),
+    "nsenter": (_CARRIER_PROGRAM, _NSENTER_OPTIONS_WITH_ARG, None),
+    "unshare": (_CARRIER_PROGRAM, _UNSHARE_OPTIONS_WITH_ARG, None),
+}
+
+# Characters that make a rebuilt token unsafe to leave bare when it is re-parsed
+# as shell text on the next recursion hop.
+_NEEDS_CARRIER_QUOTE = frozenset(" \t\n'\"`$;&|<>()\\")
 
 
-def _ssh_remote_command(args: list[str]) -> str | None:
-    """Return the command an ssh invocation would run on the remote host, or None.
+def _join_carrier_tokens(tokens: list[str]) -> str:
+    """Rebuild a payload string from shlex tokens with re-parse fidelity.
 
-    ssh carries its remote command as plain positional arguments after
-    ``[user@]host`` — everything past the host is sent verbatim to the remote
-    shell. Surfaces that inner command as an executable payload so the deny /
-    hardline / dangerous layers see what will actually run on the other side,
-    the same way ``bash -c`` payloads already do. Without it, ``ssh vps 'rm -rf
-    /data'`` reads as the benign command ``ssh`` with quoted DATA, and every
-    anchored deny glob (``rm -rf*``) silently misses the fleet's entire ssh
-    workload.
+    The outer shlex pass strips ONE quoting level, so a multi-token payload can
+    hold a token that itself contains spaces (``bash -lc 'rm -rf /data'``
+    tokenizes to [bash, -lc, 'rm -rf /data']). A naive space-join flattens that
+    boundary and the re-parse misaligns everything after it — bash -lc would own
+    only ``rm``. Re-quote such tokens; a single-token payload stays bare so
+    whole-string glob matching keeps its shape (``ssh vps 'rm -rf /data'`` must
+    yield ``rm -rf /data``, not ``'rm -rf /data'``).
+    """
+    if len(tokens) <= 1:
+        return " ".join(tokens)
+    return " ".join(
+        shlex.quote(t) if any(c in t for c in _NEEDS_CARRIER_QUOTE) else t
+        for t in tokens)
 
-    An unknown ``-x`` flag is treated as valueless and skipped: OpenSSH would
-    reject the line anyway, and skipping still finds the host. When no host can
-    be located (every token parsed as an option) the whole remainder is
-    surfaced instead — fail-safe, a few extra harmless candidates beat a missed
-    carrier — except for a bare ``ssh`` with nothing after it.
+
+def _skip_carrier_options(args: list[str], with_arg: frozenset[str]) -> int:
+    """Return the index of the first positional token in a carrier's args.
+
+    ``--`` ends the options; attached values (-p22, -oKey=val, --env=X) count as
+    one token; short bundles (-4qt) consume one unless a value-taking letter
+    appears, in which case the rest of the token (or the next token) is its
+    value. An unknown flag is treated as valueless and skipped — the real
+    program would reject the line, and skipping still finds the boundary.
     """
     index = 0
     end_of_options = False
@@ -992,54 +1048,101 @@ def _ssh_remote_command(args: list[str]) -> str | None:
             index += 1
             continue
         if end_of_options or not token.startswith("-") or token == "-":
-            break  # first positional token = [user@]host
-        if token.startswith("--"):
-            index += 1
+            break  # first positional token
+        option, equals, _ = token.partition("=")
+        if token.startswith("--") or equals:
+            index += 1 if equals else (2 if option in with_arg else 1)
             continue
         letters = token[1:]
         cursor = 0
         while cursor < len(letters):
             flag = "-" + letters[cursor]
-            if flag in _SSH_OPTIONS_WITH_ARG:
-                # Attached value (-p22, -oKey=val, -Ffile) or the next token.
+            if flag in with_arg:
                 attached = letters[cursor + 1:]
                 index += 1 if attached else 2
                 break
             cursor += 1
         else:
-            index += 1  # bundle of no-arg flags (-4qt)
+            index += 1  # bundle of no-arg flags (-4qt, -it)
+    return index
+
+
+def _carrier_payload(carrier: str, args: list[str]) -> str | None:
+    """Extract the command *carrier* will actually run from its already-tokenized
+    args, or None when it runs nothing remote/inner (bare ``ssh host``)."""
+    kind, with_arg, value_options = _CARRIER_SPECS[carrier]
+    if kind == _CARRIER_WRAPPER:
+        rest = args[_skip_carrier_options(args, with_arg):]
+        return _join_carrier_tokens(rest) if rest else None
+    if kind == _CARRIER_OPTION_OWNED:
+        index = 0
+        while index < len(args):
+            token = args[index]
+            for option in value_options:
+                if token == option:
+                    return args[index + 1] if index + 1 < len(args) else None
+                if token.startswith(option + "=") or (
+                        not option.startswith("--") and token.startswith(option)
+                        and len(token) > len(option)):
+                    return token[len(option):].lstrip("=")
+            index += 1
+        return None
+    index = _skip_carrier_options(args, with_arg)
     if index >= len(args):
-        return " ".join(args) if args else None
-    remote = args[index + 1:]
-    if not remote:
-        return None  # bare `ssh host` — nothing runs remotely
-    return " ".join(remote)
+        return None
+    remote = args[index:] if kind == _CARRIER_PROGRAM else args[index + 1:]
+    if remote and remote[0] == "--":
+        remote = remote[1:]
+    return _join_carrier_tokens(remote) if remote else None
 
 
-def _ssh_remote_payloads(command: str):
-    """Yield remote commands carried by ssh invocations in *command*.
+def _carrier_for_tokens(tokens: list[str]) -> tuple[str, list[str]] | None:
+    """Return (carrier name, its args) for a command-position token list."""
+    name = os.path.basename(
+        _deobfuscate_shell_word_for_detection(tokens[0])).lower()
+    if name in ("docker", "kubectl") and len(tokens) > 1 and tokens[1].lower() == "exec":
+        return f"{name} exec", tokens[2:]
+    if name in _CARRIER_SPECS:
+        return name, tokens[1:]
+    return None
 
-    Same segment/command-word walk as ``_execution_flag_findings``, scoped to the
-    ssh executable and yielding ONLY the remote payloads. Deliberately kept out
+
+def _carrier_remote_payloads(command: str):
+    """Yield inner/remote commands carried by the carriers in *command*.
+
+    Same segment/command-word walk as ``_execution_flag_findings``, scoped to
+    carrier executables and yielding ONLY the payloads. Deliberately kept out
     of ``_execution_flag_findings``: every finding there auto-flags the command
     as dangerous (``detect_dangerous_command`` treats a finding as proof of
-    local program execution), and an ssh line is not itself a local execution
-    mechanism — its payload runs on the remote host. Feeding the payloads as
-    VARIANTS instead lets the deny / hardline / dangerous-pattern layers match
-    what will actually run on the other side without prompting on every ssh
-    command the fleet issues.
+    LOCAL program execution), and a carrier line is not itself a local
+    execution mechanism — its payload runs in another context. Feeding the
+    payloads as VARIANTS instead lets the deny / hardline / dangerous-pattern
+    layers match what will actually run on the other side without prompting on
+    every carrier command the fleet issues. Nested carriers (``ssh vps 'docker
+    exec c1 rm -rf /data'``) resolve hop by hop through the callers' pending
+    recursion, which re-feeds each payload as a new source.
     """
     for segment in _iter_top_level_shell_segments(command):
         for start, _, word in _iter_shell_command_word_spans(segment):
             executable = _deobfuscate_shell_word_for_detection(word)
-            if os.path.basename(executable).lower() != "ssh":
+            if os.path.basename(executable).lower() not in _CARRIER_NAMES:
                 continue
             tokens = _shell_segment_tokens(segment, start)
             if not tokens:
                 continue
-            payload = _ssh_remote_command(tokens[1:])
+            found = _carrier_for_tokens(tokens)
+            if found is None:
+                continue
+            carrier, args = found
+            payload = _carrier_payload(carrier, args)
             if payload:
                 yield payload
+
+
+# Executable names that can open a carrier (two-word carriers are matched on
+# tokens[1] in _carrier_for_tokens).
+_CARRIER_NAMES = frozenset(
+    {"ssh", "sshpass", "mosh", "docker", "kubectl", "su", "nsenter", "unshare"})
 
 
 def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
@@ -1511,7 +1614,7 @@ def _deny_command_variants(command: str):
         for _, payload in _execution_flag_findings(source):
             if payload:
                 pending.append(payload)
-        pending.extend(_ssh_remote_payloads(source))
+        pending.extend(_carrier_remote_payloads(source))
 
 
 def _command_detection_variants(command: str):
@@ -1556,8 +1659,8 @@ def _command_detection_variants(command: str):
                 pending.append(payload)
         # ssh-carried remote commands: variants to pattern-match, not findings — the
         # payload runs remotely, so it must reach the pattern/hardline layers without
-        # auto-flagging the local ssh line itself (see _ssh_remote_payloads).
-        for payload in _ssh_remote_payloads(source):
+        # auto-flagging the local carrier line itself (see _carrier_remote_payloads).
+        for payload in _carrier_remote_payloads(source):
             if fresh(payload):
                 yield payload
                 marked_payload = _mark_command_starts(payload)

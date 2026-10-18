@@ -12,6 +12,7 @@ import pytest
 from tools import approval as mod
 from tools import approval_floors
 from tools import approval_context
+from tools.approval_detection import _carrier_remote_payloads, _execution_flag_findings
 
 @pytest.fixture
 def deny_config(monkeypatch):
@@ -253,3 +254,167 @@ class TestDenyOrdering:
         deny_config(["git push --force*"])
         result = mod.check_dangerous_command("ls -la", "local")
         assert result["approved"] is True
+
+
+# --- remote carriers ---------------------------------------------------------------------------
+# A carrier passes the real command to another execution context (remote shell,
+# container, namespace, login shell), so the outer program looks benign while
+# the inner command hides in its arguments. The deny globs must still reach it.
+
+CARRIER_DENY = ["rm -rf*", "docker rm*", "docker system prune*", "uci set*", "mkfs*"]
+
+CARRIER_ATTACKS = [
+    # sshpass — the auto-password ssh wrapper (its tail is another command line)
+    ("sshpass -p", "sshpass -p secret ssh vps 'rm -rf /data'", "rm -rf*"),
+    ("sshpass -e", "sshpass -e ssh vps 'docker rm -f x'", "docker rm*"),
+    ("sshpass -f", "sshpass -f /pw ssh vps 'rm -rf /data'", "rm -rf*"),
+    ("sshpass inner ssh options", "sshpass -p secret ssh -p 22 -i k vps 'rm -rf /data'", "rm -rf*"),
+    ("sshpass inner bash -lc", "sshpass -p s ssh vps 'bash -lc \"rm -rf /data\"'", "rm -rf*"),
+    # mosh — remote command after the host (with or without `--`)
+    ("mosh --", "mosh vps -- 'rm -rf /data'", "rm -rf*"),
+    ("mosh bare", "mosh vps rm -rf /data", "rm -rf*"),
+    ("mosh --ssh", "mosh --ssh='ssh -p 22' vps -- 'docker rm -f x'", "docker rm*"),
+    # docker exec — command after the container name
+    ("docker exec basic", "docker exec -it c1 rm -rf /data", "rm -rf*"),
+    ("docker exec -u", "docker exec -u root c1 rm -rf /data", "rm -rf*"),
+    ("docker exec -e", "docker exec -e X=1 c1 docker rm -f x", "docker rm*"),
+    ("docker exec --", "docker exec -it c1 -- rm -rf /data", "rm -rf*"),
+    ("docker exec bash -lc", "docker exec -it c1 bash -lc 'rm -rf /data'", "rm -rf*"),
+    ("docker exec inner ssh", "docker exec -it c1 ssh vps 'rm -rf /data'", "rm -rf*"),
+    # kubectl exec — command after the pod (optionally after `--`)
+    ("kubectl exec --", "kubectl exec pod -- rm -rf /data", "rm -rf*"),
+    ("kubectl exec -c -n", "kubectl exec -n ns -c c pod -- docker rm -f x", "docker rm*"),
+    ("kubectl exec bare", "kubectl exec pod rm -rf /data", "rm -rf*"),
+    ("kubectl exec bash -lc", "kubectl exec pod -- bash -lc 'rm -rf /data'", "rm -rf*"),
+    # su -c — the command IS the option value
+    ("su -c single", "su -c 'rm -rf /data'", "rm -rf*"),
+    ("su -c double", 'su -c "rm -rf /data"', "rm -rf*"),
+    ("su -c user", "su -c 'rm -rf /data' root", "rm -rf*"),
+    ("su -s shell", "su -s /bin/sh -c 'rm -rf /data'", "rm -rf*"),
+    # nsenter / unshare — the first positional token IS the program
+    ("nsenter basic", "nsenter -t 1 -a rm -rf /data", "rm -rf*"),
+    ("nsenter many flags", "nsenter -t 1 -m -u -i -n -p rm -rf /", "rm -rf*"),
+    ("nsenter --wd", "nsenter -t 1 --wd=/ sh -c 'rm -rf /data'", "rm -rf*"),
+    ("unshare --", "unshare -m -- rm -rf /data", "rm -rf*"),
+    ("unshare bare", "unshare -m rm -rf /data", "rm -rf*"),
+    ("unshare sh -c", "unshare -m sh -c 'rm -rf /data'", "rm -rf*"),
+]
+
+CARRIER_BENIGN = [
+    "docker exec -it c1 ls /data",
+    "docker exec -it c1 docker ps -a",
+    "kubectl exec pod -- ps aux",
+    "sshpass -p x ssh vps 'uptime'",
+    "mosh vps",
+    "su -c 'whoami'",
+    "nsenter -t 1 hostname",
+    "unshare -m true",
+]
+
+
+class TestCarrierDenyFollows:
+    """A deny glob must reach the command a carrier actually runs, no matter
+    which context (remote shell / container / namespace / login shell) it runs
+    in — these forms are the fleet's whole workload, not exotic edge cases."""
+
+    @pytest.mark.parametrize("carrier_name,command,expected", CARRIER_ATTACKS,
+                             ids=[name for name, _, _ in CARRIER_ATTACKS])
+    def test_carrier_forms_hit_deny(self, deny_config, clean_env, carrier_name, command, expected):
+        deny_config(CARRIER_DENY)
+        assert approval_floors._match_user_deny_rule(command) == expected
+
+    @pytest.mark.parametrize("command", [
+        # double and triple shells — the fleet's real combination shapes
+        'ssh vps "docker exec -it c1 rm -rf /data"',
+        "ssh vps 'docker exec -it c1 \"rm -rf /data\"'",
+        "sshpass -p s ssh vps 'docker exec -it c1 rm -rf /data'",
+        "true && docker exec -it c1 rm -rf /data",
+        "FOO=bar sshpass -p s ssh vps 'rm -rf /data'",
+    ])
+    def test_nested_carriers_recurse(self, deny_config, clean_env, command):
+        deny_config(["rm -rf*"])
+        assert approval_floors._match_user_deny_rule(command) == "rm -rf*"
+
+    def test_guard_layers_agree(self, deny_config, clean_env):
+        deny_config(["rm -rf*"])
+        for guard in (mod.check_dangerous_command, mod.check_all_command_guards):
+            result = guard("docker exec -it c1 rm -rf /data", "local")
+            assert result.get("user_deny") is True, guard
+            assert result["approved"] is False
+
+    def test_carrier_cannot_skip_deny_under_yolo(self, deny_config, clean_env, monkeypatch):
+        deny_config(["rm -rf*"])
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
+        for guard in (mod.check_dangerous_command, mod.check_all_command_guards):
+            result = guard("nsenter -t 1 -a rm -rf /data", "local")
+            assert result.get("user_deny") is True, guard
+            assert result["approved"] is False
+
+    def test_hardline_sees_root_delete_through_carrier(self, deny_config, clean_env):
+        from tools.approval_detection import detect_hardline_command
+        for command in ("ssh vps 'rm -rf /'", "docker exec -it c1 rm -rf /",
+                        "nsenter -t 1 -a rm -rf /"):
+            assert detect_hardline_command(command)[0] is True, command
+
+
+class TestCarrierBenignUnaffected:
+    """Routine carrier traffic must keep passing untouched — a carrier is not a
+    verdict, and quoted references stay data (projection, not substring)."""
+
+    @pytest.mark.parametrize("command", CARRIER_BENIGN)
+    def test_benign_carrier_commands_pass(self, deny_config, clean_env, command):
+        deny_config(CARRIER_DENY)
+        assert approval_floors._match_user_deny_rule(command) is None
+
+    @pytest.mark.parametrize("command", [
+        'echo "docker exec -it c1 rm -rf /data"',
+        'git commit -m "try kubectl exec pod -- rm -rf /data later"',
+        "printf '%s' 'sshpass -p s ssh vps rm -rf /data'",
+    ])
+    def test_quoted_references_do_not_hit(self, deny_config, clean_env, command):
+        deny_config(CARRIER_DENY)
+        assert approval_floors._match_user_deny_rule(command) is None
+
+
+class TestCarrierPayloadExtraction:
+    """Boundary rules: positional (everything after the host/container/pod),
+    program (the first positional IS the program), wrapper (the whole tail is
+    another command line), option-owned (su -c's value)."""
+
+    def test_positional_boundary(self):
+        for command, expected in (
+                ("ssh vps 'rm -rf /data'", "rm -rf /data"),
+                ("ssh -p 22 vps 'docker rm -f x'", "docker rm -f x"),
+                ("docker exec -it c1 rm -rf /data", "rm -rf /data"),
+                ("docker exec -it c1 -- rm -rf /data", "rm -rf /data"),
+                ("kubectl exec pod -- rm -rf /data", "rm -rf /data"),
+                ("mosh vps -- 'rm -rf /data'", "rm -rf /data")):
+            assert list(_carrier_remote_payloads(command)) == [expected], command
+
+    def test_program_boundary(self):
+        for command in ("nsenter -t 1 -a rm -rf /data", "unshare -m rm -rf /data",
+                        "unshare -m -- rm -rf /data"):
+            assert list(_carrier_remote_payloads(command)) == ["rm -rf /data"], command
+
+    def test_wrapper_boundary(self):
+        assert list(_carrier_remote_payloads(
+            "sshpass -p s ssh vps 'rm -rf /data'")) == ["ssh vps 'rm -rf /data'"]
+
+    def test_option_owned_boundary(self):
+        assert list(_carrier_remote_payloads("su -c 'rm -rf /data' root")) == ["rm -rf /data"]
+
+    def test_bare_carriers_yield_nothing(self):
+        for command in ("ssh vps", "ssh", "docker exec -it c1", "kubectl exec pod",
+                        "sshpass -e", "mosh vps", "su", "nsenter -t 1", "unshare -m"):
+            assert list(_carrier_remote_payloads(command)) == [], command
+
+    def test_reparse_fidelity_preserves_inner_quoting(self):
+        # A multi-token payload re-quotes embedded-space tokens so the NEXT hop's
+        # option parsing keeps its boundaries (bash -lc must own the whole inner
+        # command, not just its first word).
+        payloads = list(_carrier_remote_payloads("docker exec -it c1 bash -lc 'rm -rf /data'"))
+        assert payloads == ["bash -lc 'rm -rf /data'"]
+        assert list(_execution_flag_findings(payloads[0])) == [
+            ("shell command via -c/-lc flag", "rm -rf /data")]
+        # A single-token payload stays bare so whole-string globs keep their shape.
+        assert list(_carrier_remote_payloads("ssh vps 'rm -rf /data'")) == ["rm -rf /data"]
