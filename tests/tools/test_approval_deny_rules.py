@@ -418,3 +418,40 @@ class TestCarrierPayloadExtraction:
             ("shell command via -c/-lc flag", "rm -rf /data")]
         # A single-token payload stays bare so whole-string globs keep their shape.
         assert list(_carrier_remote_payloads("ssh vps 'rm -rf /data'")) == ["rm -rf /data"]
+
+
+class TestSudoFormHitsDeny:
+    """Anchor the sudo-wrapper behavior that phase 3 proved ALREADY COVERED.
+
+    Phase 3 (adding a ``sudo`` row to ``_CARRIER_SPECS``) was opened on the
+    hypothesis that sudo-wrapped commands were a deny bypass, then CLOSED: a
+    probe on the phase-2 tree showed every sudo form already hits the deny
+    globs, because the executable-projection walk surfaces a later unquoted
+    command word (``sudo rm -rf /data`` projects ``rm -rf /data``; ``sudo su
+    -c ...`` additionally unwraps through the ``su`` carrier). That coverage is a
+    SIDE EFFECT of the projection machinery — the repo's own suite already leans
+    on it (``timeout 5 /usr/bin/sudo -n id -u`` matches ``sudo *``) — so nothing
+    states it as a contract. These assertions pin it: if a future refactor
+    narrows projection to the first executable only, these forms would silently
+    stop hitting again.
+    """
+    SUDO_FORMS = [
+        # sudo wrapper: projection reaches the inner command word.
+        ("sudo rm -rf /data", "rm -rf*"),
+        # sudo + su -c: the su carrier unwraps the quoted payload.
+        ("sudo su -c 'rm -rf /data'", "rm -rf*"),
+        # the fleet's real double-shell shape (ssh phase 1 -> sudo -> rm).
+        ("ssh vps 'sudo rm -rf /data'", "rm -rf*"),
+    ]
+
+    @pytest.mark.parametrize("command,expected", SUDO_FORMS,
+                             ids=["sudo-wrapper", "sudo-su-c", "ssh-sudo-double-shell"])
+    def test_sudo_form_hits_deny(self, deny_config, clean_env, command, expected):
+        deny_config(["rm -rf*"])
+        assert approval_floors._match_user_deny_rule(command) == expected
+
+    @pytest.mark.parametrize("command", ["sudo -n true", "sudo systemctl status caddy",
+                                         "sudo -l", "sudo -i"])
+    def test_benign_sudo_still_passes(self, deny_config, clean_env, command):
+        deny_config(["rm -rf*"])
+        assert approval_floors._match_user_deny_rule(command) is None
