@@ -956,6 +956,92 @@ def _bash_exec_payload(args: list[str]) -> tuple[bool, str | None]:
     return False, None
 
 
+# OpenSSH's documented option letters, split by whether they consume a value. A few letters
+# (-c/-m/-S/-W/-b/-e/-l/-o/-p) also exist in other tools; they are parsed in ssh's OWN context
+# here, exactly like every other carrier in this module. Sources: ssh(1), "OPTIONS".
+_SSH_OPTIONS_WITH_ARG = frozenset(
+    "-B -b -c -D -E -e -F -I -i -J -L -l -m -O -o -p -Q -R -S -W -w".split())
+_SSH_OPTIONS_NO_ARG = frozenset(
+    "-4 -6 -A -a -C -f -G -g -K -k -M -N -n -q -s -T -t -V -v -X -x -Y -y".split())
+
+
+def _ssh_remote_command(args: list[str]) -> str | None:
+    """Return the command an ssh invocation would run on the remote host, or None.
+
+    ssh carries its remote command as plain positional arguments after
+    ``[user@]host`` — everything past the host is sent verbatim to the remote
+    shell. Surfaces that inner command as an executable payload so the deny /
+    hardline / dangerous layers see what will actually run on the other side,
+    the same way ``bash -c`` payloads already do. Without it, ``ssh vps 'rm -rf
+    /data'`` reads as the benign command ``ssh`` with quoted DATA, and every
+    anchored deny glob (``rm -rf*``) silently misses the fleet's entire ssh
+    workload.
+
+    An unknown ``-x`` flag is treated as valueless and skipped: OpenSSH would
+    reject the line anyway, and skipping still finds the host. When no host can
+    be located (every token parsed as an option) the whole remainder is
+    surfaced instead — fail-safe, a few extra harmless candidates beat a missed
+    carrier — except for a bare ``ssh`` with nothing after it.
+    """
+    index = 0
+    end_of_options = False
+    while index < len(args):
+        token = args[index]
+        if not end_of_options and token == "--":
+            end_of_options = True
+            index += 1
+            continue
+        if end_of_options or not token.startswith("-") or token == "-":
+            break  # first positional token = [user@]host
+        if token.startswith("--"):
+            index += 1
+            continue
+        letters = token[1:]
+        cursor = 0
+        while cursor < len(letters):
+            flag = "-" + letters[cursor]
+            if flag in _SSH_OPTIONS_WITH_ARG:
+                # Attached value (-p22, -oKey=val, -Ffile) or the next token.
+                attached = letters[cursor + 1:]
+                index += 1 if attached else 2
+                break
+            cursor += 1
+        else:
+            index += 1  # bundle of no-arg flags (-4qt)
+    if index >= len(args):
+        return " ".join(args) if args else None
+    remote = args[index + 1:]
+    if not remote:
+        return None  # bare `ssh host` — nothing runs remotely
+    return " ".join(remote)
+
+
+def _ssh_remote_payloads(command: str):
+    """Yield remote commands carried by ssh invocations in *command*.
+
+    Same segment/command-word walk as ``_execution_flag_findings``, scoped to the
+    ssh executable and yielding ONLY the remote payloads. Deliberately kept out
+    of ``_execution_flag_findings``: every finding there auto-flags the command
+    as dangerous (``detect_dangerous_command`` treats a finding as proof of
+    local program execution), and an ssh line is not itself a local execution
+    mechanism — its payload runs on the remote host. Feeding the payloads as
+    VARIANTS instead lets the deny / hardline / dangerous-pattern layers match
+    what will actually run on the other side without prompting on every ssh
+    command the fleet issues.
+    """
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = _deobfuscate_shell_word_for_detection(word)
+            if os.path.basename(executable).lower() != "ssh":
+                continue
+            tokens = _shell_segment_tokens(segment, start)
+            if not tokens:
+                continue
+            payload = _ssh_remote_command(tokens[1:])
+            if payload:
+                yield payload
+
+
 def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
     """Return (option, program) for a read-only tool's program-running flag."""
     flags = _READ_TOOL_EXEC_FLAGS[tool]
@@ -1425,6 +1511,7 @@ def _deny_command_variants(command: str):
         for _, payload in _execution_flag_findings(source):
             if payload:
                 pending.append(payload)
+        pending.extend(_ssh_remote_payloads(source))
 
 
 def _command_detection_variants(command: str):
@@ -1457,11 +1544,22 @@ def _command_detection_variants(command: str):
     # hardline floor inspect what will actually run without promoting similar flags or quoted prose.
     pending = [normalized]
     while pending:
-        for _, payload in _execution_flag_findings(pending.pop()):
+        source = pending.pop()
+        for _, payload in _execution_flag_findings(source):
             if fresh(payload):
                 yield payload
                 # A payload may start with an option-looking program and then invoke a hardline command
                 # after a separator; mark its starts.
+                marked_payload = _mark_command_starts(payload)
+                if marked_payload != payload and fresh(marked_payload):
+                    yield marked_payload
+                pending.append(payload)
+        # ssh-carried remote commands: variants to pattern-match, not findings — the
+        # payload runs remotely, so it must reach the pattern/hardline layers without
+        # auto-flagging the local ssh line itself (see _ssh_remote_payloads).
+        for payload in _ssh_remote_payloads(source):
+            if fresh(payload):
+                yield payload
                 marked_payload = _mark_command_starts(payload)
                 if marked_payload != payload and fresh(marked_payload):
                     yield marked_payload
